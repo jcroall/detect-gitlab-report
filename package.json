@@ -22,15 +22,18 @@
     "test": "sudo npm i -g && detect-gitlab-report"
   },
   "dependencies": {
+    "@actions/glob": "^0.2.1",
     "@gitbeaker/node": "^35.4.0",
-    "@jcroall/synopsys-sig-node": "^1.0.66",
+    "@jcroall/synopsys-sig-node": "^1.1.10",
     "axios": "^0.26.1",
     "chalk": "^4.1.0",
     "clear": "^0.1.0",
     "commander": "^7.1.0",
+    "fast-glob": "^3.2.11",
     "figlet": "^1.5.0",
     "got": "^12.0.1",
     "ky": "^0.30.0",
+    "nodejs-file-downloader": "^4.9.3",
     "path": "^0.12.7"
   },
   "devDependencies": {
