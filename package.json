@@ -3,7 +3,7 @@
   "description": "Integrate Synopsys Black Duck Results Into GitLab",
   "license": "Apache-2.0",
   "author": "James Croall",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "lib/index.js",
   "bin": {
     "detect-gitlab-report": "bin/detect-gitlab-report"
