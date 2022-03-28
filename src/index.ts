@@ -1,85 +1,58 @@
 #!/usr/bin/env node
 
 import {
-  gitlabCreateDiscussion,
-  gitlabGetDiffMap,
   gitlabGetDiscussions,
-  gitlabGetProject,
-  SigmaIssuesView,
   gitlabUpdateNote,
-  CoverityIssuesView,
-  CoverityProjectIssue,
-  coverityMapMatchingMergeKeys,
-  coverityCreateReviewCommentMessage,
-  coverityCreateIssueCommentMessage,
-  COVERITY_COMMENT_PREFACE,
-  coverityIsInDiff,
-  githubRelativizePath,
-  coverityIsPresent,
-  coverityCreateNoLongerPresentMessage
+  BlackduckApiService,
+  findOrDownloadDetect,
+  IRapidScanResults,
+  createRapidScanReportString
 } from "@jcroall/synopsys-sig-node/lib/"
 
-import {sigmaCreateMessageFromIssue, sigmaIsInDiff, sigmaUuidCommentOf} from "@jcroall/synopsys-sig-node/lib"
 import {logger} from "@jcroall/synopsys-sig-node/lib";
 import * as fs from "fs";
-import {Gitlab} from "@gitbeaker/node";
-import { BaseRequestOptions } from '@gitbeaker/core/dist/types/types'
-import {gitlabCreateDiscussionWithoutPosition} from "@jcroall/synopsys-sig-node/lib/utils/gitlab-utils";
-import {relatavize_path} from "@jcroall/synopsys-sig-node/lib/utils/misc-utils";
-
+import * as os from "os";
+import path from "path";
+import {runDetect} from "@jcroall/synopsys-sig-node/lib/blackduck/detect/detect-manager";
+import {POLICY_SEVERITY, SUCCESS} from "@jcroall/synopsys-sig-node/lib/blackduck/detect/exit-codes";
+import {gitlabCreateDiscussionWithoutPosition} from "@jcroall/synopsys-sig-node/lib/gitlab/discussions";
 
 const chalk = require('chalk')
 const figlet = require('figlet')
 const program = require('commander')
 
+const COMMENT_PREFACE = '<!-- Comment automatically managed by Detect Integration, do not remove this line -->'
+
 export async function main(): Promise<void> {
   console.log(
       chalk.blue(
-          figlet.textSync('coverity-gitlab', { horizontalLayout: 'full' })
+          figlet.textSync('detect-gitlab', { horizontalLayout: 'full' })
       )
   )
   program
-      .description("Integrate Synopsys Coveirty Static Analysis into GitLab")
-      .option('-j, --json <Coverity Results v7 JSON>', 'Location of the Coverity Results v7 JSON')
-      .option('-u, --coverity-url <Coverity URL>', 'Location of the Coverity server')
-      .option('-p, --coverity-project <Coverity Project Name>', 'Name of Coverity project')
+      .description("Integrate Synopsys Black Duck Software Composition Analysis into GitLab")
+      .requiredOption('-u, --url <Black Duck URL>', 'Location of the Black Duck Hub server')
+      .requiredOption('-t, --token <Black Duck API Token>', 'Black Duck API Token')
+      .option('-v, --detect-version <Version number>', 'Version of Detect to use')
+      .option('-m, --scan-mode <RAPID|INTELLIGENT>', 'Black Duck scan mode')
+      .option('-f, --fail-on-all', 'Fail on all policy severities')
+      .option('-s, --detect-trust-cert', 'Explicitly trust Black Duck Hub SSL Cert')
       .option('-d, --debug', 'Enable debug mode (extra verbosity)')
       .parse(process.argv)
 
   const options = program.opts()
 
-  logger.info(`Starting Coverity GitLab Integration`)
+  logger.info(`Starting Black Duck GitLab Integration`)
 
-  const COVERITY_URL = process.env['COVERITY_URL']
-  const COVERITY_PROJECT = process.env['COVERITY_PROJECT']
-  const COV_USER = process.env['COV_USER']
-  const COVERITY_PASSPHRASE = process.env['COVERITY_PASSPHRASE']
+  const BLACKDUCK_URL = options.url
+  const BLACKDUCK_API_TOKEN = options.token
+  const SCAN_MODE = options.scanMode ? options.scanMode : "RAPID"
+  const FAIL_ON_ALL = options.failOnAll ? options.failOnAll : false
+  const DETECT_TRUST_CERT = options.detectTrustCert ? options.detectTrustCert : false
 
-  let coverity_url = options.coverityUrl ? options.coverityUrl as string : COVERITY_URL
-  if (!coverity_url) {
-    logger.error(`Must specify Coverity URL in arguments or environment`)
+  if (SCAN_MODE != "RAPID" && SCAN_MODE != "INTELLIGENT") {
+    logger.error(`Scan mode must be RAPID or INTELLIGENT`)
     process.exit(1)
-  }
-
-  let coverity_project_name = options.coverityProject ? options.coverityProject as string : COVERITY_PROJECT
-  if (!coverity_project_name) {
-    logger.error(`Must specify Coverity Project in arguments or environment`)
-    process.exit(1)
-  }
-
-  const coverity_results_file: string = undefined === options.json
-      ? 'coverity-results.json'
-      : options.json || 'coverity-results.json'
-
-  logger.info(`Using JSON file path: ${coverity_results_file}`)
-
-  if (!process.argv.slice(2).length) {
-    program.outputHelp()
-  }
-
-  if (options.debug) {
-    logger.level = 'debug'
-    logger.debug(`Enabled debug mode`)
   }
 
   const GITLAB_TOKEN = process.env['GITLAB_TOKEN']
@@ -111,143 +84,141 @@ export async function main(): Promise<void> {
     }
   }
 
-  if (!is_merge_request) {
-    logger.info('Not a Pull Request. Nothing to do...')
-    return
-  }
+  const runnerTemp = os.tmpdir()
+  const outputPath = path.resolve(runnerTemp, 'blackduck')
 
-  const merge_request_iid = parseInt(CI_MERGE_REQUEST_IID, 10)
+  if (SCAN_MODE === 'RAPID') {
+    logger.info('Checking that you have at least one enabled policy...')
 
-  logger.info(`Connecting to GitLab: ${CI_SERVER_URL}`)
+    const blackduckApiService = new BlackduckApiService(BLACKDUCK_URL, BLACKDUCK_API_TOKEN)
+    const blackDuckBearerToken = await blackduckApiService.getBearerToken()
+    let policiesExist: boolean | void = await blackduckApiService.checkIfEnabledBlackduckPoliciesExist(blackDuckBearerToken).catch(reason => {
+      logger.error(`Could not verify whether policies existed: ${reason}`)
+    })
 
-  let project = await gitlabGetProject(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID)
-  logger.debug(`Project=${project.name}`)
-
-  // TODO validate file exists and is .json?
-  const jsonV7Content = fs.readFileSync(coverity_results_file)
-  const coverityIssues = JSON.parse(jsonV7Content.toString()) as CoverityIssuesView
-
-  let mergeKeyToIssue = new Map<string, CoverityProjectIssue>()
-
-  const canCheckCoverity = coverity_url && COV_USER && COVERITY_PASSPHRASE && coverity_project_name
-  if (!canCheckCoverity) {
-    logger.warn('Missing Coverity Connect info. Issues will not be checked against the server.')
-  } else {
-    const allMergeKeys = coverityIssues.issues.map(issue => issue.mergeKey)
-    const allUniqueMergeKeys = new Set<string>(allMergeKeys)
-
-    if (canCheckCoverity && coverityIssues && coverityIssues.issues.length > 0) {
-      try {
-        mergeKeyToIssue = await coverityMapMatchingMergeKeys(coverity_url, COV_USER, COVERITY_PASSPHRASE,
-            coverity_project_name, allUniqueMergeKeys)
-      } catch (error: any) {
-        logger.error(error as string | Error)
-        process.exit(1)
-      }
-    }
-  }
-
-  const newReviewComments = []
-
-  const review_discussions = await gitlabGetDiscussions(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid).
-    then(discussions => discussions.filter(discussion => discussion.notes![0].body.includes(COVERITY_COMMENT_PREFACE)))
-  const diff_map = await gitlabGetDiffMap(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid)
-
-  for (const issue of coverityIssues.issues) {
-    logger.info(`Found Coverity Issue ${issue.mergeKey} at ${issue.strippedMainEventFilePathname}:${issue.mainEventLineNumber}`)
-
-    const projectIssue = mergeKeyToIssue.get(issue.mergeKey)
-    let ignoredOnServer = false
-    let newOnServer = true
-    if (projectIssue) {
-      ignoredOnServer = projectIssue.action == 'Ignore' || projectIssue.classification in ['False Positive', 'Intentional']
-      newOnServer = projectIssue.firstSnapshotId == projectIssue.lastSnapshotId
-      logger.info(`Issue state on server: ignored=${ignoredOnServer}, new=${newOnServer}`)
-    }
-
-    const reviewCommentBody = coverityCreateReviewCommentMessage(issue)
-
-    let path = issue.strippedMainEventFilePathname.startsWith('/') ?
-        relatavize_path(process.cwd(), issue.strippedMainEventFilePathname) :
-        issue.strippedMainEventFilePathname
-
-    let file_link = `${CI_SERVER_URL}/${process.env.CI_PROJECT_NAMESPACE}/${process.env.CI_PROJECT_NAME}/-/blob/${process.env.CI_COMMIT_REF_NAME}/${path}#L${issue.mainEventLineNumber}`
-    const issueCommentBody = coverityCreateIssueCommentMessage(issue, file_link)
-
-    const review_discussion_index = review_discussions.findIndex(
-        discussion => discussion.notes![0].position?.new_line === issue.mainEventLineNumber &&
-            discussion.notes![0].body.includes(issue.mergeKey))
-    let existing_discussion = undefined
-    if (review_discussion_index !== -1) {
-      existing_discussion = review_discussions.splice(review_discussion_index, 1)[0]
-    }
-
-    const comment_index = review_discussions.findIndex(discussion => discussion.notes![0].body.includes(issue.mergeKey))
-    let existing_comment = undefined
-    if (comment_index !== -1) {
-      existing_comment = review_discussions.splice(comment_index, 1)[0]
-    }
-
-    if (existing_discussion !== undefined) {
-      logger.info(`Issue already reported in discussion #${existing_discussion.id} note #${existing_discussion.notes![0].id}, updating if necessary...`)
-      if (existing_discussion.notes![0].body !== reviewCommentBody) {
-        await gitlabUpdateNote(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid,
-            parseInt(existing_discussion.id, 10),
-            existing_discussion.notes![0].id,
-            reviewCommentBody).catch(error => {
-              logger.error(`Unable to update discussion: ${error.message}`)
-        })
-
-      }
-    } else if (existing_comment !== undefined) {
-      logger.info(`Issue already reported in discussion #${existing_comment.id} note #${existing_comment.notes![0].id}, updating if necessary...`)
-      if (existing_comment.notes![0].body !== issueCommentBody) {
-        await gitlabUpdateNote(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid,
-            parseInt(existing_comment.id, 10),
-            existing_comment.notes![0].id,
-            reviewCommentBody).catch(error => {
-              logger.error(`Unable to update discussion: ${error.message}`)
-        })
-      }
-    } else if (ignoredOnServer) {
-      logger.info('Issue ignored on server, no comment needed.')
-    } else if (!newOnServer) {
-      logger.info('Issue already existed on server, no comment needed.')
-    } else if (coverityIsInDiff(issue, diff_map)) {
-      logger.info('Issue not reported, adding a comment to the review.')
-
-      await gitlabCreateDiscussion(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid, issue.mainEventLineNumber,
-          issue.strippedMainEventFilePathname, reviewCommentBody, CI_MERGE_REQUEST_DIFF_BASE_SHA ? CI_MERGE_REQUEST_DIFF_BASE_SHA : '',
-          CI_COMMIT_SHA ? CI_COMMIT_SHA : '').catch(error => {
-            logger.error(`Unable to create discussion: ${error.message}`)
-      })
+    if (policiesExist === undefined) {
+      logger.error('Could not determine if policies existed. Eixting.')
+      process.exit(1)
+    } else if (!policiesExist) {
+      logger.error(`Could not run using ${SCAN_MODE} scan mode. No enabled policies found on the specified Black Duck server.`)
+      process.exit(1)
     } else {
-      logger.info('Issue not reported, adding an issue comment.')
-
-      await gitlabCreateDiscussionWithoutPosition(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid, issue.mainEventLineNumber,
-          issue.strippedMainEventFilePathname, issueCommentBody).catch(error => {
-            logger.error(`Unable to create discussion: ${error.message}`)
-      })
+      logger.info(`You have at least one enabled policy, executing in ${SCAN_MODE} scan mode...`)
     }
   }
 
-  for (const discussion of review_discussions) {
-    if (coverityIsPresent(discussion.notes![0].body)) {
-      logger.info(`Discussion #${discussion.id} Note #${discussion.notes![0].id} represents a Coverity issue which is no longer present, updating comment to reflect resolution.`)
-      await gitlabUpdateNote(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid,
-          parseInt(discussion.id, 10),
-          discussion.notes![0].id, coverityCreateNoLongerPresentMessage(discussion.notes![0].body)).catch(error => {
-            logger.error(`Unable to update note #${discussion.notes![0].id}: ${error.message}`)
-      })
-    }
-  }
-
-  logger.info(`Found ${coverityIssues.issues.length} Coverity issues.`)
-
-  if (coverityIssues.issues.length > 0) {
+  const detectPath = await findOrDownloadDetect(runnerTemp).catch(reason => {
+    logger.error(`Unable to download Detect: ${reason}`)
     process.exit(1)
+  })
+
+  const detectArgs = [`--blackduck.url=${BLACKDUCK_URL}`,
+    `--blackduck.api.token=${BLACKDUCK_API_TOKEN}`,
+    `--detect.blackduck.scan.mode=${SCAN_MODE}`,
+    `--detect.output.path=${outputPath}`,
+    `--detect.scan.output.path=${outputPath}`]
+
+  if (DETECT_TRUST_CERT) {
+    detectArgs.push('--blackduck.trust.cert=TRUE')
+  }
+
+  logger.info(`Executing: ${detectPath} ${detectArgs}`)
+
+  if (detectPath === undefined) {
+    logger.debug(`Could not determine detect path. Canceling policy check.`)
+    process.exit(1)
+  }
+
+  const detectExitCode = await runDetect(detectPath, detectArgs).catch(reason => {
+    logger.error(`Could not execute ${detectPath}: ${reason}`)
+    process.exit(1)
+  })
+
+  if (detectExitCode === undefined) {
+    logger.error(`Could not determine detect exit code. Canceling policy check.`)
+    process.exit(1)
+  } else if (detectExitCode > 0 && detectExitCode != POLICY_SEVERITY) {
+    logger.error(`Detect failed with exit code: ${detectExitCode}. Check the logs for more information.`)
+    process.exit(1)
+  }
+
+  logger.info(`Detect executed successfully.`)
+
+  let hasPolicyViolations = false
+
+  if (SCAN_MODE === 'RAPID') {
+    logger.info(`Detect executed in RAPID mode. Beginning reporting...`)
+
+    const jsonGlobber = require('fast-glob')
+    const scanJsonPaths = await jsonGlobber(`${outputPath}/*.json`)
+
+    const scanJsonPath = scanJsonPaths[0]
+    const rawdata = fs.readFileSync(scanJsonPath)
+    const policyViolations = JSON.parse(rawdata.toString()) as IRapidScanResults[]
+
+    hasPolicyViolations = policyViolations.length > 0
+    logger.debug(`Policy Violations Present: ${hasPolicyViolations}`)
+
+    const failureConditionsMet = detectExitCode === POLICY_SEVERITY || FAIL_ON_ALL
+    const rapidScanReport = await createRapidScanReportString(BLACKDUCK_URL, BLACKDUCK_API_TOKEN,
+        policyViolations, hasPolicyViolations && failureConditionsMet)
+
+    if (is_merge_request) {
+      logger.info('This is a merge request, commenting...')
+      const message = COMMENT_PREFACE.concat('\r\n', rapidScanReport)
+
+      const merge_request_iid = parseInt(CI_MERGE_REQUEST_IID, 10)
+
+      const review_discussions = await gitlabGetDiscussions(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid).
+        then(discussions => discussions.filter(discussion => discussion.notes![0].body.includes(COMMENT_PREFACE)))
+
+      if (review_discussions.length > 0) {
+        logger.info(`Updating existing discussion #${review_discussions[0].id} note #${review_discussions[0].notes![0].id}`)
+        await gitlabUpdateNote(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid,
+            parseInt(review_discussions[0].id, 10), review_discussions[0].notes![0].id, message)
+      } else {
+        logger.info(`Creating a new comment`)
+        await gitlabCreateDiscussionWithoutPosition(CI_SERVER_URL, GITLAB_TOKEN, CI_PROJECT_ID, merge_request_iid,
+            message)
+      }
+
+      logger.info('Successfully commented on PR.')
+    }
+
+    if (hasPolicyViolations) {
+      if (failureConditionsMet) {
+        logger.info('Components found that violate your Black Duck Policies!')
+      } else {
+        logger.info('No components violated your BLOCKER or CRITICAL Black Duck Policies!')
+      }
+    } else {
+      logger.info('No components found that violate your Black Duck policies!')
+    }
+    logger.info('Reporting complete.')
   } else {
-    process.exit(0)
+    logger.info(`Executed in ${SCAN_MODE} mode. Skipping policy check.`)
+  }
+
+  const diagnosticMode = process.env.DETECT_DIAGNOSTIC?.toLowerCase() === 'true'
+  const extendedDiagnosticMode = process.env.DETECT_DIAGNOSTIC_EXTENDED?.toLowerCase() === 'true'
+  if (diagnosticMode || extendedDiagnosticMode) {
+
+    const diagnosticGlobber = require('fast-glob');
+    const diagnosticZip = await diagnosticGlobber([`${outputPath}/runs/*.zip`]);
+
+    fs.copyFile(diagnosticZip[0], "detect-diagnostic-logs.zip", (err) => {
+      if (err) {
+        logger.warn(`Unable to copy diagnostic logs to detect-diagnostic-logs.zip: ${err}`)
+      }
+    })
+  }
+
+  if (hasPolicyViolations) {
+    logger.warn('Found dependencies violating policy!')
+  } else if (detectExitCode > 0) {
+    logger.warn('Dependency check failed! See Detect output for more information.')
+  } else if (detectExitCode === SUCCESS) {
+    logger.info('None of your dependencies violate your Black Duck policies!')
   }
 }
 
