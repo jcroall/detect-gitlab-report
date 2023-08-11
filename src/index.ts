@@ -50,7 +50,9 @@ export async function main(): Promise<void> {
   const SCAN_MODE = options.scanMode ? options.scanMode : "RAPID"
   const FAIL_ON_ALL = options.failOnAll ? options.failOnAll : false
   const DETECT_TRUST_CERT = options.detectTrustCert ? options.detectTrustCert : false
-  const ERROR_EXIT = options.errorExit ? options.errorExit : false
+  const ERROR_EXIT = Boolean(options.errorExit)
+  const DETECT_VERSION = options.detectVersion ? options.detectVersion : undefined
+  const DEBUG = Boolean(options.debug)
 
   if (SCAN_MODE != "RAPID" && SCAN_MODE != "INTELLIGENT") {
     logger.error(`Scan mode must be RAPID or INTELLIGENT`)
@@ -109,7 +111,7 @@ export async function main(): Promise<void> {
     }
   }
 
-  const detectPath = await findOrDownloadDetect(runnerTemp).catch(reason => {
+  const detectPath = await findOrDownloadDetect(runnerTemp, DEBUG, DETECT_VERSION).catch(reason => {
     logger.error(`Unable to download Detect: ${reason}`)
     process.exit(1)
   })
