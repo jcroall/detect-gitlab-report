@@ -37,6 +37,7 @@ export async function main(): Promise<void> {
       .option('-m, --scan-mode <RAPID|INTELLIGENT>', 'Black Duck scan mode')
       .option('-f, --fail-on-all', 'Fail on all policy severities')
       .option('-s, --detect-trust-cert', 'Explicitly trust Black Duck Hub SSL Cert')
+      .option('-e, --error-exit', 'Exit with error code on policy violation or Black Duck error')
       .option('-d, --debug', 'Enable debug mode (extra verbosity)')
       .parse(process.argv)
 
@@ -49,6 +50,9 @@ export async function main(): Promise<void> {
   const SCAN_MODE = options.scanMode ? options.scanMode : "RAPID"
   const FAIL_ON_ALL = options.failOnAll ? options.failOnAll : false
   const DETECT_TRUST_CERT = options.detectTrustCert ? options.detectTrustCert : false
+  const ERROR_EXIT = Boolean(options.errorExit)
+  const DETECT_VERSION = options.detectVersion ? options.detectVersion : undefined
+  const DEBUG = Boolean(options.debug)
 
   if (SCAN_MODE != "RAPID" && SCAN_MODE != "INTELLIGENT") {
     logger.error(`Scan mode must be RAPID or INTELLIGENT`)
@@ -107,7 +111,7 @@ export async function main(): Promise<void> {
     }
   }
 
-  const detectPath = await findOrDownloadDetect(runnerTemp).catch(reason => {
+  const detectPath = await findOrDownloadDetect(runnerTemp, DEBUG, DETECT_VERSION).catch(reason => {
     logger.error(`Unable to download Detect: ${reason}`)
     process.exit(1)
   })
@@ -215,8 +219,14 @@ export async function main(): Promise<void> {
 
   if (hasPolicyViolations) {
     logger.warn('Found dependencies violating policy!')
+    if (ERROR_EXIT) {
+      process.exit(1)
+    }
   } else if (detectExitCode > 0) {
     logger.warn('Dependency check failed! See Detect output for more information.')
+    if (ERROR_EXIT) {
+      process.exit(1)
+    }
   } else if (detectExitCode === SUCCESS) {
     logger.info('None of your dependencies violate your Black Duck policies!')
   }
